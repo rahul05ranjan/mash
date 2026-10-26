@@ -1,80 +1,75 @@
 ---
 type: Reference
 title: mash Quickstart
-description: Entry point for mash (mProv Admin Shell), a Python CLI that talks to the mProv Control Center (mPCC). Covers installation, shell usage, configuration, command surface, and links to architecture, integration, and plugin documentation.
-tags: [mash, mprov, cli, quickstart, shell]
+description: Entry point for the mash (mProv Admin Shell) wiki — what the tool is, how to install and run it, its command surface, and where to find architecture, development, and testing documentation.
 resource: src/mash/main.py
+tags: [quickstart, mprov, shell, cli]
 ---
 
 # mash (mProv Admin Shell)
 
-`mash` is the command-line admin shell for the **mProv Control Center (mPCC)**, the control-plane API of the mProv NG bare-metal provisioning system. It is an interactive and scriptable `cmd`-based shell that authenticates to an mPCC, dynamically discovers the mPCC's data models, and exposes generic CRUD commands (`create`/`retrieve`/`update`/`delete`) against them, plus shell features like variables, Jinja2 templating, `foreach` loops, background jobs, and plugins such as `bmc` for node power control.
-
-Package metadata lives in [setup.cfg](../setup.cfg) (distribution name `mprov_mash`), version in `VERSION` (currently `0.0.9`), and dependencies in [requirements.txt](../requirements.txt): `pyyaml`, `jinja2`, `requests`. Python >= 3.8 is required.
+mash is the command-line utility for talking to the [mProv Control Center
+(mPCC)](https://github.com/mprov-ng/). It is simultaneously an interactive
+shell (a Python `cmd.Cmd` loop with its own variables, Jinja2 templating, and
+`foreach` loops) and a script runner: you can pipe a script into it or pass a
+script file on the command line.
 
 ## Install and run
 
+Requires Python 3.8+. From a checkout, install the package — this pulls the
+three dependencies (`pyyaml`, `jinja2`, `requests`) and puts `mash` on your
+PATH:
+
 ```bash
-pip install -r requirements.txt   # dev deps
-python -m build && pip install dist/*.whl   # or install the published mprov_mash package
-mash                               # interactive shell
-mash script.mash                   # run a script file
-cat script.mash | mash             # pipe a script on stdin
+pip install .
+mash                           # interactive shell
+mash script.mash               # run a script file (wins over piped stdin)
+some-tool | mash               # read commands from piped stdin
 ```
 
-The installed `mash` entrypoint is the bash wrapper [src/mash/mash](../src/mash/mash), which verifies Python >= 3.8 and then runs `python -m mash.main`. See [Architecture Overview](architecture/overview.md) for how input mode (interactive / file / FIFO) is detected and dispatched.
+To work without installing (e.g. in a source checkout), install the
+requirements and point Python at the src layout:
 
-## First session
+```bash
+pip install -r requirements.txt
+PYTHONPATH=src python -m mash.main
+```
+
+The installed `mash` command is a bash wrapper that checks the version of the
+first `python3` on your PATH and runs `python -m mash.main`, so install into
+the environment whose `bin/` comes first on PATH (a virtualenv you have
+activated is the usual case).
+
+## First commands
 
 ```text
-<mProv> # connect https://mprov.example.com/ apikey <API_KEY>
-<mProv> # models                      # list models discovered from the mPCC
-<mProv> # model node                   # show one model's fields/schema
-<mProv> # retrieve node name=compute0001
-<mProv> # pvar MPROV_RESULT            # last response body is stored in MPROV_RESULT
-<mProv> # bmc power on compute00[01-20]
-<mProv> # exit
+<mProv> # connect https://mpcc.example/ apikey <key>
+<mProv> # models                  # list data models fetched from the mPCC
+<mProv> # retrieve node id=1      # GET; result lands in MPROV_RESULT
+<mProv> # pvar MPROV_RESULT
+<mProv> # create node name=compute001 ...
+<mProv> # bmc power on compute00[01-05]   # plugin command
 ```
 
-## Command surface
+`connect` with no arguments reads `mprovURL` and `apikey` from the first
+readable config file among `~/.mprov-mash.yaml`, `/etc/mprov/mash.yaml`, and
+`/etc/mprov/jobserver.yaml`. A trailing `&` on a data command runs the request
+in the background. Comments start with `#`; `{{ var }}` templates are rendered
+against variables set with `let`.
 
-| Command | Purpose |
-|---|---|
-| `connect` / `disconnect` | Authenticate to an mPCC (API key, user/password, or config file) and fetch data models. See [mProv Control Center Integration](integrations/mprov-control-center.md). |
-| `create` `retrieve` `update` `delete` (aliases `post` `get` `patch`) | Generic CRUD against any discovered mPCC model. |
-| `let` / `pvar` (`p`) / `print` | Shell variables with Jinja2 `{{var}}` templating and backtick command capture. |
-| `foreach` … `endforeach` | Loop over a list variable or whitespace string; commands are collected then replayed with templating. |
-| `seq` | Build a zero-padded numeric sequence list variable (pairs with `foreach`). |
-| `models` / `model <name>` | Inspect models discovered from the mPCC. |
-| `bmc power <action> <node_range>` | Plugin command: node power on/off/cycle/reset via mPCC, accepting slurm-style node ranges. |
-| `help` | Lists built-in commands **and** all discovered plugins in `mash.plugins`. |
+## Where to go next
 
-Any unrecognized first word is looked up as a plugin module — see [Plugin System](plugins/development.md).
-
-## Configuration file resolution
-
-`connect` with no arguments (and only then) loads YAML config, first usable file wins ([src/mash/app.py](../src/mash/app.py), `load_config`):
-
-1. `~/.mprov-mash.yaml` (user)
-2. `/etc/mprov/mash.yaml`
-3. `/etc/mprov/jobserver.yaml` — fallback so mash works on mProv jobserver hosts (added for issue #4)
-
-Expected shape: a top-level `global:` section with `mprovURL` and `apikey`. The loader flattens the top-level YAML entries into one dict, and registers a no-op `!include` constructor (placeholder, currently unused).
-
-## Build, versioning, release
-
-- Version comes from the `VERSION` file, or the `MASH_VERSION` env var at build time ([setup.py](../setup.py)).
-- [ci.yml](../.github/workflows/ci.yml) triggers on GitHub **release published**: writes the release tag into `VERSION`, builds with `python -m build`, and publishes to PyPI as `mprov_mash`.
-- `gen_changelog.sh` prints commit summaries between tags (caveat: its commit links point at the `mprov_jobserver` repo — likely a copy-paste bug).
-
-## Change guidance
-
-- New shell behavior → [Architecture Overview](architecture/overview.md) (precmd/cmdloop/templating pipeline is the load-bearing machinery).
-- New mPCC interaction or auth method → [mProv Control Center Integration](integrations/mprov-control-center.md).
-- New subsystem command → add a module under `src/mash/plugins/` with a `PluginCMD` class ([Plugin System](plugins/development.md)).
-- There are **no tests in this repo**; validate changes by running the shell against a live/mock mPCC or piping scripted sessions via `echo '...' | mash`.
+- [Architecture overview](architecture/overview.md) — startup and command-source
+  precedence, the shell loop, connect/config lookup, CRUD-to-HTTP mapping, and
+  the plugin system behind commands like `bmc`.
+- [Development, testing, and CI](development-and-testing.md) — dev install, the
+  pytest suite and the issue regressions each file pins, and the GitHub Actions
+  workflows.
 
 ## Backlog
 
-- **skills/** directory: empty, no documentation value.
-- **OpenAPI/model schema detail**: model shapes are discovered at runtime from the mPCC `/datamodel/` endpoint; not statically known in this repo.
+- Plugin authoring guide — only one plugin (`src/mash/plugins/bmc.py`) exists;
+  the `PluginCMD` contract is documented inline in the architecture page until
+  a second plugin establishes a pattern.
+- Shell scripting edge cases (`foreach` failure semantics, `seq`, `let`
+  backticks) — documented from source only, no tests exist for them yet.

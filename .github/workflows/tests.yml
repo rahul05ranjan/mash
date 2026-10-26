@@ -1,0 +1,39 @@
+name: Tests
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      # Agent instructions only; they can't affect the tests.
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+  pull_request:
+    branches:
+      - master
+    paths-ignore:
+      # Agent instructions only; they can't affect the tests.
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.9 is Rocky 9's system Python.
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: python -m pytest -v tests

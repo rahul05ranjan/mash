@@ -1,70 +1,122 @@
 ---
-type: System Architecture
-title: mash Shell Architecture
-description: How the mash shell starts, picks input mode, resolves configuration, and processes each command line through precmd templating, cmd.Cmd dispatch, plugin fallback, foreach loops, and fork-based background jobs.
-tags: [architecture, shell, cmd-loop, templating, jinja2, scripting]
+type: Architecture
+title: mash Architecture Overview
+description: How mash starts, chooses its command source, connects to the mProv Control Center, resolves config files, executes CRUD commands over HTTP, and dispatches unknown commands to plugins.
 resource: src/mash/app.py
+tags: [architecture, shell, mprov, plugins, http]
 ---
 
-# Shell Architecture
+# mash Architecture Overview
 
-mash is a single Python package (`src/mash/`) built around Python's stdlib `cmd.Cmd`. Nearly all logic lives in one class, `MprovShell` in [src/mash/app.py](../../src/mash/app.py) (~650 lines).
+mash is a single-process Python application built on the standard library's
+[`cmd.Cmd`](https://docs.python.org/3/library/cmd.html) class. Everything
+happens inside one shell object that holds the connection to the mProv Control
+Center (mPCC), the session variables, and the loaded data models.
 
-## Startup path
+## Startup and command source
 
-1. The installed script `src/mash/mash` (bash) checks Python >= 3.8 and runs `python -m mash.main`.
-2. [src/mash/main.py](../../src/mash/main.py) installs no-op SIGINT/SIGTERM handlers, constructs `MprovShell`, and chooses an input mode:
-   - **stdin is a FIFO** (`S_ISFIFO(os.fstat(0).st_mode)`) → script piped in via `shell.setFile(sys.stdin)`.
-   - **argv[1] is an existing path** → script file mode via `open(sys.argv[1])`.
-   - otherwise → interactive REPL.
-3. `shell.cmdloop()` runs. In file mode (`cmdloop` override), `self.quiet = True` suppresses the per-command "OK" noise and each line is fed through `onecmd(precmd(line))`; comments (`#`) are stripped here and again in `precmd`.
+The installed `mash` command is a bash wrapper
+([`src/mash/mash`](../../src/mash/mash)) that checks the Python version is
+≥ 3.8 and then runs `python -m mash.main`.
 
-## The per-line pipeline (`precmd` → dispatch → `default`)
+[`mash.main`](../../src/mash/main.py) installs no-op SIGINT/SIGTERM handlers,
+creates a single `MprovShell`, and picks the command source with bash/python-like
+precedence:
 
-`precmd` is the heart of the shell ([app.py](../../src/mash/app.py), lines ~607-623):
+1. A script file as `sys.argv[1]` (anything other than `-`) is opened and used,
+   even when stdin is a pipe. A missing/unreadable file exits with
+   `mash: <path>: <error>`.
+2. `-` as the only argument, or a non-TTY stdin, means read commands from stdin.
+3. Otherwise run the interactive shell.
 
-- Lines starting with `#` become empty (comments).
-- If inside a `foreach` loop, the line is **accumulated** into `forLoopCmds` instead of executed (only `endforeach` passes through).
-- Otherwise the line is rendered through **Jinja2** (`renderString`) with all shell variables as the template context — this is how `{{var}}` substitution works on every command line, not just `let`.
+This precedence is pinned by a regression test, see
+[Development, Testing, and CI](../development-and-testing.md) (issue #9).
 
-Standard `cmd.Cmd` then dispatches `do_<name>` methods (`connect`, `create`, `let`, `foreach`, `seq`, ...). Unknown commands fall into `MprovShell.default()`, which attempts **plugin dispatch** — see [Plugin System](../plugins/development.md).
+## The shell loop
 
-`self.print()` (not builtin `print`) writes to `self.stdout` so internal capture works: `execInternal()` swaps `self.stdout` for a `StringIO`, runs `onecmd`, and returns the captured text. This powers backtick assignment in `let x=\`some command\``.
+`MprovShell` ([`src/mash/app.py`](../../src/mash/app.py)) overrides `cmdloop`
+so script/stdin mode iterates lines directly (with `quiet = True`, suppressing
+the `OK` echoes), while interactive mode uses `Cmd.cmdloop`. `precmd` strips
+`#` comments, collects lines into the pending `foreach` body while inside a
+loop, and otherwise renders each line through Jinja2 against the shell's
+internal variables — so `{{ var }}` templating works on every command line.
 
-## Variables and templating
+Commands are the `do_*` methods: `connect`/`disconnect`, CRUD commands
+(`create`/`retrieve`/`update`/`delete` with `post`/`get`/`patch`/`delete`
+aliases), variable commands (`let`, `pvar`/`p`, `print`), loop commands
+(`foreach`/`endforeach`, `seq`), and model inspection (`models`, `model`).
 
-Shell state lives on the instance: `variables` dict, `session` (a `requests.Session`), `mprovURL`, `models`, `processes`, loop state. `do_let` supports:
+## Connecting and config lookup
 
-- literal assignment (`let foo=bar`)
-- Jinja2 references to prior variables (`let x=hello {{foo}}` — rendered by `precmd` before `do_let` even sees it)
-- `` `cmd `` → captured output of another shell command via `execInternal`
-- `$var` → direct copy of another variable's value (important in loops, where precmd templating may already have substituted)
+`do_connect` supports three auth forms plus a config-file form; malformed
+argument shapes print a usage error instead of raising (issue #15):
 
-The result of the last successful CRUD call is stored in `MPROV_RESULT` by `_sendHttpRequest` (see [mProv Control Center Integration](../integrations/mprov-control-center.md)), making it available to subsequent `{{MPROV_RESULT.field}}` templates.
+- `connect <url> apikey <key>` → `Api-Key` header
+- `connect <url> user <user> password <pw>` or `connect <url> user <user>` →
+  HTTP Basic auth; the no-password form prompts with `getpass` only when stdin
+  is a TTY, and errors clearly otherwise
+- `connect` (no args) → reads `mprovURL` and `apikey` from the `global` section
+  of the first readable config file among, in order:
+  `~/.mprov-mash.yaml`, `/etc/mprov/mash.yaml`, `/etc/mprov/jobserver.yaml`
+  (the job server's own config, added for issue #4). When none is readable, the
+  error lists each path tried and why it was skipped (issue #7). Config parsing
+  accepts the job server's multi-document list shape and stubs its `!include`
+  tag.
 
-## Control flow: foreach and seq
+On a successful connection, `_connectToMPCC` GETs the base URL; on 200 it calls
+`_getMPCCModels`, which pulls `/datamodel/` and then each model's structure
+from `/datamodel/?model=<name>` into `self.models`. These models drive argument
+validation for later CRUD commands.
 
-`foreach item in list|varname` sets loop state and changes the prompt; subsequent lines are buffered by `precmd`. `endforeach` replays the buffered commands once per list item, setting the loop variable and running each buffered command through `renderString` before `onecmd`. **If any command in the loop returns False, the whole loop aborts.** `seq var start end width` builds a zero-padded list variable designed to feed `foreach`.
+## CRUD and HTTP
 
-Note the loop model buffers commands, then executes them after `endforeach` — mid-loop edits at the prompt are not possible, and nested loops are not supported (single flat loop-state set on the instance).
+All data commands funnel through `_sendHttpRequest(method, arg, ...)`:
 
-## Background jobs (fork)
+- The first token is the model name; it must exist in `self.models` and have an
+  `endpoint`, otherwise the command errors without an HTTP call.
+- `post`/`patch` parse `key=value` args, validate keys against the model's
+  `fields`, check required fields (for `create`), and send JSON. `id`/`pk`
+  become part of the URL path instead of the body.
+- `get`/`delete` build a query string; `id=`/`pk=` also become a URL path
+  segment.
+- A trailing `&` forks the process so the request runs in the background; the
+  parent tracks the pid in `self.processes` and `disconnect` waits for them.
+  Backgrounded requests never set `MPROV_RESULT`.
+- Successful responses set the internal variable `MPROV_RESULT` to the parsed
+  JSON (or `None` on error), which scripts then read with `pvar` or `$var`
+  copies in `let`.
 
-A command line ending in `&` inside `_sendHttpRequest` calls `os.fork()`: the child performs the HTTP request and `sys.exit(0)`; the parent records the pid in `self.processes` and returns immediately. `do_disconnect` waits for all background children (`os.wait()` loop) before closing the session. The `bmc` plugin has its own `&` handling in its `precmd` ([plugins/bmc.py](../../src/mash/plugins/bmc.py)).
+Values passed as `[a,b]` are parsed into lists via `_parseArgType`; dict values
+(`{...}`) are explicitly unsupported.
 
-## Config resolution
+## Plugin dispatch
 
-`load_config()` picks the first readable of `~/.mprov-mash.yaml` → `/etc/mprov/mash.yaml` → `/etc/mprov/jobserver.yaml` (the jobserver fallback was added so mash works out-of-the-box on mProv controller nodes; see issue #4 in git history). The YAML top-level entries are flattened into one dict; only `global.apikey` and `global.mprovURL` are consumed today. A `!include` YAML constructor is registered but is an unused no-op stub.
+`MprovShell.default` treats any unrecognized command as a plugin name: it looks
+up `mash.plugins.<name>` with `importlib`, instantiates the module's
+`PluginCMD` class (a `cmd.Cmd` subclass receiving the shell instance), and
+routes the rest of the line to it via `onecmd`. `help` with no arguments lists
+the plugin files found in `src/mash/plugins/`, and `help <plugin>` delegates to
+the plugin's own help.
+
+The one shipped plugin is [`bmc`](../../src/mash/plugins/bmc.py): `bmc power
+<on|off|cycle|reset> <node_spec>` sends `GET power/<action>/?hostname=<node>`
+per node, expanding Slurm-style node ranges like `compute00[01-20,23]` with
+`rangeToList` from [`mash.utils`](../../src/mash/utils.py).
 
 ## Utilities
 
-[src/mash/utils.py](../../src/mash/utils.py) provides:
+`mash.utils` holds two pure helpers: `getDottedStrValue` (dotted-path lookup on
+nested dicts) and `rangeToList` (Slurm node-range expansion, with padded-zero
+validation). Both are plugin-facing; the core shell currently uses only
+`rangeToList` indirectly through `bmc`.
 
-- `rangeToList(spec)` — expands slurm-style node ranges (`compute00[01-20,25]`) into explicit node lists, enforcing zero-pad width consistency. Used by the `bmc` plugin.
-- `getDottedStrValue(dstring, obj)` — walks `a.b.c` paths into nested dicts (currently not referenced by app.py; available for plugin use).
+## Gotchas
 
-## Change guidance
-
-- Adding a built-in command: add `do_<name>` to `MprovShell`; remember `precmd` templating runs first, and use `self.print` for capturable output.
-- Anything touching `precmd` affects templating, comments, and foreach buffering simultaneously.
-- No test suite exists; exercise changes with scripted sessions (`printf '...' | mash`).
+- `MprovShell` defines class-level mutable attributes (`variables`, `models`,
+  `processes`, `session`). Creating a second instance shares them; tests work
+  around this by mutating the fixture instance.
+- `renderString` catches template errors but references `e.message`, which does
+  not exist on modern exceptions — a template failure during `precmd` can raise
+  `AttributeError` instead of the intended message.
+- HTTP calls use `timeout=None`; a hanging mPCC blocks the shell (except for
+  `&`-backgrounded requests).

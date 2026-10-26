@@ -6,4 +6,4 @@ description: "Files and subdirectories in Architecture."
 
 # Files
 
-- [mash Shell Architecture](overview.md) - How the mash shell starts, picks input mode, resolves configuration, and processes each command line through precmd templating, cmd.Cmd dispatch, plugin fallback, foreach loops, and fork-based background jobs.
+- [mash Architecture Overview](overview.md) - How mash starts, chooses its command source, connects to the mProv Control Center, resolves config files, executes CRUD commands over HTTP, and dispatches unknown commands to plugins.
